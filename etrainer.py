@@ -24,6 +24,7 @@ from unet import UNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 from eevaluate import etest
+from etrainerfunctions import pointwise_equivariance_error, rotate, gradient
 import functools
 
 import PIL
@@ -97,14 +98,15 @@ class ScaleJitteredDataset(torch.utils.data.Dataset):
         return len(self.dataset)
     
 class RandomAngleDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset):
+    def __init__(self, dataset, fill=0):
         self.dataset=dataset
+        self.fill = fill
     def __getitem__(self, idx):
         image, true_mask = self.dataset.__getitem__(idx)
        
         angle=random.uniform(-10,10)
-        image=torchvision.transforms.functional.rotate(image, angle)
-        true_mask=torchvision.transforms.functional.rotate(true_mask, angle)
+        image=torchvision.transforms.functional.rotate(image, angle, fill=self.fill)
+        true_mask=torchvision.transforms.functional.rotate(true_mask, angle,fill=self.fill)
         return image, true_mask
     def __len__(self):
         return len(self.dataset)
@@ -115,8 +117,7 @@ deformation= torchvision.transforms.Resize((512,512), interpolation=TF.Interpola
 ydeformation =torch.full([1,512,512], 0, device=device, dtype=torch.float32)
 deformation = torch.stack([deformation, ydeformation], dim=3)
 
-def rotate(angle):
-            return lambda inputs : torchvision.transforms.functional.rotate(inputs, angle)
+
         
 def shift(x, shiftnum=1, axis=-1):
     x=torch.transpose(x, axis, -1)
@@ -156,7 +157,7 @@ class RandomDataset(torch.utils.data.Dataset):
         shiftnum = random.randint(-6,6)
         axis = random.randint(-2,-1)
         
-        functions = [shifty(shiftnum, axis), rotate(angle), torchvision.transforms.ElasticTransform(interpolation=TF.InterpolationMode.NEAREST)]
+        functions = [shifty(shiftnum, axis), rotate(angle), torchvision.transforms.ElasticTransform(interpolation=TF.InterpolationMode.NEAREST),rotate(90)]
             
         randcombo = functools.reduce(compose, functions)
         stacked=randcombo(stacked)
@@ -169,7 +170,7 @@ class RandomDataset(torch.utils.data.Dataset):
     
     
 #split must equal 'test' or 'trainval'
-def config_data(etransforms=None, augmented=False, split='trainval', batch_size=1, **kwargs):
+def config_data(aug_transforms=None, augmented=False, split='trainval', batch_size=1, **kwargs):
     totensor=torchvision.transforms.PILToTensor()
     resize=torchvision.transforms.Resize((224,224))
     resizedtensor=torchvision.transforms.Compose([resize,totensor])
@@ -179,14 +180,17 @@ def config_data(etransforms=None, augmented=False, split='trainval', batch_size=
     if kwargs['HeLa']:
         dataset0= HeLaDataset(f"C:\\Users\\jjkjj\\Equivariant\\ISBI-2012-challenge\\{split.removesuffix('val')}-volume.tif",f"C:\\Users\\jjkjj\\Equivariant\\ISBI-2012-challenge\\{split.removesuffix('val')}-labels.tif", 30)
     
-    if augmented == True:
+    if augmented in [True, 'True no identity']:
         if kwargs['Oxford']:       
-            transformed_datasets=[torchvision.datasets.OxfordIIITPet(root="C:\\Users\\jjkjj\\Equivariant\\", split=split, target_types='segmentation', download=True, transform=torchvision.transforms.Compose([resizedtensor,f[1]]), target_transform=torchvision.transforms.Compose([resizedtensor,f[0]])) for f in etransforms]
+            transformed_datasets=[torchvision.datasets.OxfordIIITPet(root="C:\\Users\\jjkjj\\Equivariant\\", split=split, target_types='segmentation', download=True, transform=torchvision.transforms.Compose([resizedtensor,f[1]]), target_transform=torchvision.transforms.Compose([resizedtensor,f[0]])) for f in aug_transforms]
         if kwargs['HeLa']:  
-            transformed_datasets=[HeLaDataset(f"C:\\Users\\jjkjj\\Equivariant\\ISBI-2012-challenge\\{split.removesuffix('val')}-volume.tif",f"C:\\Users\\jjkjj\\Equivariant\\ISBI-2012-challenge\\{split.removesuffix('val')}-labels.tif", 30, transform=f[1], target_transform=f[0]) for f in etransforms]
-
-        all_datasets=[dataset0]+transformed_datasets
-        dataset=CombinedDataset(all_datasets)
+            transformed_datasets=[HeLaDataset(f"C:\\Users\\jjkjj\\Equivariant\\ISBI-2012-challenge\\{split.removesuffix('val')}-volume.tif",f"C:\\Users\\jjkjj\\Equivariant\\ISBI-2012-challenge\\{split.removesuffix('val')}-labels.tif", 30, transform=f[1], target_transform=f[0]) for f in aug_transforms]
+        if augmented == True:
+            all_datasets=[dataset0]+transformed_datasets
+            dataset=CombinedDataset(all_datasets)
+        else:
+            dataset = transformed_datasets[0] #should really be combined
+  
     
         
     elif augmented==False:
@@ -194,7 +198,7 @@ def config_data(etransforms=None, augmented=False, split='trainval', batch_size=
     elif augmented=='random':
         dataset = ScaleJitteredDataset(dataset0)
     elif augmented=='rangle':
-        dataset = RandomAngleDataset(dataset0)
+        dataset = RandomAngleDataset(dataset0, fill=0 if kwargs['HeLa'] else 1)
     elif augmented=='randcombo':
         dataset=RandomDataset(dataset0)
     
@@ -205,7 +209,7 @@ def config_data(etransforms=None, augmented=False, split='trainval', batch_size=
         train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
         train_loader = DataLoader(train_set, shuffle=True, batch_size=batch_size)
         val_loader = DataLoader(val_set, shuffle=False, drop_last=True, batch_size=batch_size)
-        return train_loader, val_loader
+        return train_loader#, val_loader
    
     return DataLoader(dataset, shuffle=True if split=='trainval' else False, batch_size=batch_size)
 
@@ -247,7 +251,9 @@ def train_model(
                  n=model.n,
                  class_weights=class_weights,
                  augmented = augmented,
-                 test_augmented = kwargs['test augmented']
+                 test_augmented = kwargs['test augmented'],
+                 test_augment = kwargs['test augment'],
+                 product_loss=kwargs['product_loss']
                 )
         )
 
@@ -262,7 +268,7 @@ def train_model(
         transforms: {model.etransforms}
         equivariant: {model.equivariant}
         Linf: {model.Linf}
-        eqweight: {model.eqweight}
+        Equivariance weight: {model.eqweight}
         n: {model.n}
         augmented: {augmented}
     ''')
@@ -270,13 +276,20 @@ def train_model(
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=25, eps=0)  # goal: maximize Dice score
+    if kwargs['lr_scheduler']=='OnPlateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=25, eps=0)  # goal: maximize Dice score
+    if kwargs['lr_scheduler']=='cyclic':
+        scheduler = optim.lr_scheduler.CyclicLR(optimizer, kwargs['min_lr'], kwargs['max_lr'], 500)
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, device=device)) if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
+    eps=1e-8
     time0=time.time()
     # 5. Begin training
     for epoch in range(1, epochs + 1):
+        if kwargs['eqweight_scheduler']:
+            model.eqweight=kwargs['eqweight_decay']*model.eqweight
+            
         timeepoch=time.time()
         #dice[0] is total dice score dice[0] is steps since dice was cleared
         dice=[0 for j in range(model.n_classes+1)]
@@ -287,7 +300,9 @@ def train_model(
             for batch in train_loader:
                 #images, true_masks = batch['image'], batch['mask']
                 images, true_masks = batch
+
                 if kwargs['wandb_project']=='Equivariant UNet':
+                    images = images.to(dtype = torch.float32, device = device)
                     true_masks=true_masks.squeeze(1)-1
                     true_masks=F.one_hot(true_masks.to(torch.int64), model.n_classes).permute(0, 3, 1, 2).to(dtype=torch.float32, device=device)
                 if kwargs['wandb_project']=='HeLa EUNet':
@@ -304,31 +319,89 @@ def train_model(
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp): #, enabled=amp):
                     masks_pred = model(images).to(device=device)
+                     # Evaluation round
+                    division_step = (len(train_loader) // (5))
+                    if division_step > 0:
+                        if global_step % division_step == 0:
+                            if kwargs['lr_scheduler']=='OnPlateau':
+                                scheduler.step(sum(dice[1:]))
+                            histograms = {}
+                            if not debugging:
+                                for tag, value in model.named_parameters():
+                                    tag = tag.replace('/', '.')
+                                    if not (torch.isinf(value) | torch.isnan(value)).any():
+                                        histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
+                                    #if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                                        #histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+                            #logging.info('Validation Dice score: {}'.format([float(dice[j]/dice[0])for j in range(1,len(dice))]))
+                            #try:
+                            if not debugging:
+                                if kwargs['wandb_project']=='Equivariant UNet':
+                                    experiment.log({
+                                        'learning rate': optimizer.param_groups[0]['lr'],
+                                        #'validation Dice': {j : float(dice[j]/dice[0]) for j in range(1,len(dice))},
+                                        'images': wandb.Image(images[0].cpu()),
+                                        #'transformed' : {
+                                            #f'Function {j+1}' : wandb.Image(f[0](images[0])) for j, f in enumerate(model.etransforms)
+                                        #},
+                                        'masks': {
+                                            'true': wandb.Image(true_masks[0].float().cpu()),
+                                            'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu())
+                                        },
+                                        #'Transformed mask' : wandb.Image((f[0](masks_pred))[0].float().cpu()),
+                                        #'Prediction for Transform' : wandb.Image(model(f[0](images[0:1])[0])[0].float().cpu()),
+                                        'step': global_step,
+                                        'epoch': epoch,
+                                        **histograms
+                                    })
+                                if kwargs['wandb_project']=='HeLa EUNet':
+                                    experiment.log({
+                                        'learning rate': optimizer.param_groups[0]['lr'],
+                                        #'validation Dice': {j : float(dice[j]/dice[0]) for j in range(1,len(dice))},
+                                        'images': wandb.Image(images[0].cpu()),
+                                        #'transformed' : {
+                                            #f'Function {j+1}' : wandb.Image(f[0](images[0])) for j, f in enumerate(model.etransforms)
+                                        #},
+                                        'masks': {
+                                            'true': wandb.Image(true_masks[0].float().cpu()),
+                                            'pred': wandb.Image((torch.round(torch.sigmoid(masks_pred[0]))*(255)).float().cpu())
+                                        },
+                                        'Transformed mask' : wandb.Image((f[0](masks_pred)).float().cpu()),
+                                        'Prediction for Transform' : wandb.Image(model(f[0](images[0:1]))[0].float().cpu()),
+                                        'step': global_step,
+                                        'epoch': epoch,
+                                        'Equivariance Weight' : model.eqweight,
+                                        **histograms
+                                    })
+                            dice=[0 for j in range(len(dice))]
+                    in_shape = images.shape[1:]
+                    batch_size = images.shape[0]
+                    del images
+                    dice=[dice[0]+1] + [dice[x]+float(dicescore(masks_pred,true_masks, num_classes=model.n_classes)[x-1]) for x in range(1,len(dice))]
+                    loss0 = criterion(masks_pred, true_masks) + 1 - dicescore(masks_pred,true_masks, num_classes=model.n_classes, round=False, average_classes=True)
+                    del masks_pred
+                    del true_masks
                     f=random.choice(model.etransforms)
                     if kwargs['eqerror']==True:
-                        randomval=sampler((1,512,512),n=model.n, cuda=True)
-                        stackedval = torch.cat((randomval, model(randomval)), dim=0)
-                        fval = f[0](stackedval)
-                        if model.Linf == False:
-                            equivariance_err=torch.mean(torch.abs(torch.log(torch.sigmoid(model(fval[0:1])))-torch.log(torch.sigmoid(fval[1:2]))))
-                        else: equivariance_err=torch.max(torch.abs(torch.log(torch.sigmoid(model(fval[0:1])))-torch.log(torch.sigmoid(fval[1:2]))))
-                            
+                        randomval=sampler(in_shape,n=model.n, cuda=True)
+                        equivariance_err = nn.functional.relu(pointwise_equivariance_error(model, randomval, f)-f[2])
+                        del randomval
                     else:
                         equivariance_err=-1
 
                     #print(masks_pred.shape, masks_pred)
                     if model.equivariant:
-                        loss0 = criterion(masks_pred, true_masks) + 1 - sum(dicescore(masks_pred,true_masks, num_classes=model.n_classes, round=False))
-                        """
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            true_masks.float(),
-                            multiclass=True
-                        )
-                        """
-                        loss = loss0 + model.eqweight*equivariance_err
+                        if kwargs['product_loss']:
+                            loss=(loss0)**2 + (model.eqweight*equivariance_err)**2
+                        else:
+                            loss = loss0 + model.eqweight*equivariance_err
+                        """if "C1norm" in kwargs:
+                            if kwargs["C1norm"]:
+                                eq_grad = kwargs["C1weight"]*gradient(equivariance_err,model)
+                                print(eq_grad, "\n")
+                                loss += eq_grad"""
                     else:
-                        loss = criterion(masks_pred, true_masks) + 1 - sum(dicescore(masks_pred,true_masks, num_classes=model.n_classes, round=False))
+                        loss = loss0
                         """
                         loss += dice_loss(
                                     F.softmax(masks_pred, dim=1).float(),
@@ -342,13 +415,24 @@ def train_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
+                scheduler.step()
+                #loss.backward()
+                #optimizer.step()
                 
-                pbar.update(images.shape[0])
+                #learning_rate = 1e-3
+                #grads = torch.autograd.grad(loss, model.parameters())
+                #param = random.choice(list(model.parameters()))
+                #C1norm = torch.autograd.functional.hessian(equivariance_func,param)
+                #print(C1norm[0].shape)
+                #for (param, grad) in zip(model.parameters(),grads):
+                #    param=param-learning_rate*grad
+                
+                pbar.update(batch_size)
                 global_step += 1
-                dice=[dice[0]+1] + [dice[x]+dicescore(masks_pred,true_masks, num_classes=model.n_classes)[x-1] for x in range(1,len(dice))]
                 epoch_loss += loss.item()
                 if not debugging:
                     experiment.log({
+                        'train total loss' : loss.item(),
                         'train loss': loss0.item() if model.equivariant else loss.item(),
                         'step': global_step,
                         'epoch': epoch,
@@ -359,87 +443,12 @@ def train_model(
                         'Time into epoch': time.time()-timeepoch,
                         'Total time' : time.time()-time0
                     })
+                    if "C1norm" in kwargs:
+                        if kwargs["C1norm"]:
+                            experiment.log({"Equivariance gradient" : eq_grad})
                 pbar.set_postfix(**{'Cumulative Dice' : [float(dice[j]/dice[0]) for j in range(1,len(dice))], 'loss (batch)': loss.item()})
             
-                # Evaluation round
-                division_step = (len(train_loader) // (5))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        scheduler.step(sum(dice[1:]))
-                        histograms = {}
-                        if not debugging:
-                            for tag, value in model.named_parameters():
-                                tag = tag.replace('/', '.')
-                                if not (torch.isinf(value) | torch.isnan(value)).any():
-                                    histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                                if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                    histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
-                        """
-                        #val_score = evaluate(model, val_loader, device, amp)
-                        #scheduler.step(torch.mean(val_score))
-                        for batch in val_loader:
-                            images, true_masks = batch
-                            true_masks=true_masks.squeeze(1)-1
-                            images=images.to(dtype=torch.float32, device=device)
-                            #print(true_masks.shape, true_masks, torch.max(true_masks), torch.min(true_masks))
-                            true_masks=F.one_hot(true_masks.to(torch.int64), model.n_classes).permute(0, 3, 1, 2).to(dtype=torch.float32, device=device)
-                            #print(true_masks.shape, true_masks)
-            
-                            assert images.shape[1] == model.n_channels, \
-                                f'Network has been defined with {model.n_channels} input channels, ' \
-                                f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                                'the images are loaded correctly.'
-
-                            #images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                            #true_masks = true_masks.to(device=device, dtype=torch.float32)
-
-                            with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp): #, enabled=amp):
-                                masks_pred = model(images).to(device=device)
-                            dice=[dice[0]+1] + [dice[x]+dicescore(masks_pred,true_masks)[x-1] for x in range(1,len(dice))]
-                        """
-                        
-                        #logging.info('Validation Dice score: {}'.format([float(dice[j]/dice[0])for j in range(1,len(dice))]))
-                        #try:
-                        if not debugging:
-                            if kwargs['wandb_project']=='Equivariant UNet':
-                                experiment.log({
-                                    'learning rate': optimizer.param_groups[0]['lr'],
-                                    #'validation Dice': {j : float(dice[j]/dice[0]) for j in range(1,len(dice))},
-                                    'images': wandb.Image(images[0].cpu()),
-                                    #'transformed' : {
-                                        #f'Function {j+1}' : wandb.Image(f[0](images[0])) for j, f in enumerate(model.etransforms)
-                                    #},
-                                    'masks': {
-                                        'true': wandb.Image(true_masks[0].float().cpu()),
-                                        'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu())
-                                    },
-                                    'Transformed mask' : wandb.Image((f[0](masks_pred))[0].float().cpu()),
-                                    'Prediction for Transform' : wandb.Image(model(f[0](images[0:1])[0])[0].float().cpu()),
-                                    'step': global_step,
-                                    'epoch': epoch,
-                                    **histograms
-                                })
-                            if kwargs['wandb_project']=='HeLa EUNet':
-                                experiment.log({
-                                    'learning rate': optimizer.param_groups[0]['lr'],
-                                    #'validation Dice': {j : float(dice[j]/dice[0]) for j in range(1,len(dice))},
-                                    'images': wandb.Image(images[0].cpu()),
-                                    #'transformed' : {
-                                        #f'Function {j+1}' : wandb.Image(f[0](images[0])) for j, f in enumerate(model.etransforms)
-                                    #},
-                                    'masks': {
-                                        'true': wandb.Image(true_masks[0].float().cpu()),
-                                        'pred': wandb.Image((torch.round(torch.sigmoid(masks_pred[0]))*(255)).float().cpu())
-                                    },
-                                    'Transformed mask' : wandb.Image((f[0](masks_pred)).float().cpu()),
-                                    'Prediction for Transform' : wandb.Image(model(f[0](images[0:1]))[0].float().cpu()),
-                                    'step': global_step,
-                                    'epoch': epoch,
-                                    **histograms
-                                })
-                        dice=[0 for j in range(len(dice))]
-                        #except:
-                            #pass
+               
         
         if save_checkpoint:
             if not debugging:
@@ -449,9 +458,13 @@ def train_model(
                 #state_dict['mask_values'] = dataset.mask_values
                 torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
                 logging.info(f'Checkpoint {epoch} saved!')
-                if 'test_on_epoch_end' in kwargs:
-                    if kwargs['test_on_epoch_end']:
-                        etest(model, config_data(HeLa=True, Oxford=False, split='test', augmented=kwargs['test augmented'], **kwargs), device, amp, run_id=experiment.id, epoch=epoch, experiment_started=True, experiment=experiment, etransforms=model.etransforms)
+        if 'test_on_epoch_end' in kwargs:
+            if kwargs['test_on_epoch_end']:
+                if kwargs['test augment'] == 'model transforms':
+                    etest(model, config_data(HeLa=kwargs['HeLa'], Oxford=kwargs['Oxford'], split='test', augmented=kwargs['test augmented'], aug_transforms=model.etransforms), device, amp, run_id=experiment.id, epoch=epoch, experiment_started=True, experiment=experiment, etransforms=model.etransforms, test_augment = kwargs['test augment'], angle=0, class_weights = None, wandb_project = kwargs['wandb_project'])
+                if kwargs['test augment'] == 'fixed rotations':
+                    for angle in [-20,-10,-5,0,5,10,20]:
+                        etest(model, config_data(HeLa=kwargs['HeLa'], Oxford=kwargs['Oxford'], split='test', augmented=kwargs['test augmented'], aug_transforms=[[rotate(angle),rotate(angle),0,1]]), device, amp, run_id=experiment.id, epoch=epoch, experiment_started=True, experiment=experiment, etransforms=[[rotate(angle),rotate(angle),0,1]], test_augment = kwargs['test augment'], angle = angle, class_weights = None, wandb_project = kwargs['wandb_project'])
         if epochbreaks:
             print('Taking a break')
             time.sleep(kwargs['break_length'])
